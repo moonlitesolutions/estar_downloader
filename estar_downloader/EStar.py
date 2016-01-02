@@ -1,7 +1,9 @@
 __version__ = 0.1
 import requests
 import logging
-
+import json
+import datetime
+from SolrClient import SolrClient
 
 class EStar:
 	APIS=[
@@ -53,7 +55,8 @@ class EStar:
 	'energy-star-certified-commercial-griddles',
 	'energy-star-certified-uninterruptible-power-supplies',
 	'energy-star-certified-ventilating-fans',
-	'energy-star-certified-commercial-steam-cookers']
+	'energy-star-certified-commercial-steam-cookers'
+	]
 
 	BASE_URL = 'http://data.energystar.gov/resource/'
 	ADDITION = '.json'
@@ -72,9 +75,10 @@ class EStar:
 			'$limit':self.limit
 		}
 		data = []
+		logging.info("Starting to fetch data for {}".format(api_name))
 		while True:
-			#Get the data, not catching any exceptions because I don't want it to live if it fails
-			logging.info("GET {} {}".format(url, params))
+			#Not catching any exceptions because I don't want it to live if it fails
+			logging.debug("GET {} {}".format(url, params))
 			res = self.rs.get(url, params=params)
 			if 200 <= res.status_code < 300:
 				new_data = res.json()
@@ -87,15 +91,76 @@ class EStar:
 				logging.error("Received other than 200 status code")
 		for item in data:
 			item['api_name'] = api_name
+
+		logging.info("Finished fetching {}. Recieved {} items.".format(api_name, len(data)))
+		self.data[api_name] = data
 		return data
 
-	def get_all(self):
-		self.data = {}
+	def get_all(self):		
 		for api in self.APIS:
-			self.data[api] = self._download_api(api)
+			self._download_api(api)
 		return self.data
 
-	def write_file(self, filepathname):
-		import json
+	def write_file(self, filepathname):		
 		with open(filepathname, 'w') as outfile:
 			json.dump([item for api in self.data.values() for item in api], outfile)
+
+	def index_to_solr(self, collection, solrclient):
+		try:
+			from SolrClient import SolrClient
+		except ImportError:
+			raise ImportError("Can't import SolrClient. Make sure it is installed")
+		if type(solrclient) is not SolrClient:
+			raise TypeError("solrclient argumnet should be a SolrClient instance.")
+		logging.info("Preparing Data for Solr Indexing")
+		out = []
+		for api in self.data:
+			for product in self.data[api]:
+				out.append(self.prep_prod(product))
+
+		solrclient.index_json(collection, json.dumps(out))
+
+	def prep_prod(self, prod):
+		out = {}
+		for field in prod:
+			try:
+				try:
+					dt = datetime.datetime.strptime(prod[field], "%Y-%m-%dT%H:%M:%S")
+					#Adding Z here since this is for date only and solr needs it
+					out[field+'_dt'] = dt.isoformat()+'Z'
+					continue
+				except (ValueError, TypeError):
+					#Not an EStar Date field
+					pass
+
+				if prod[field].isdigit():
+					out[field+'_f'] = float(prod[field])
+					continue
+				
+				#Try to convert it to the float because isdigit returns False on floats
+				try:
+					out[field+'_f'] = float(prod[field])
+					continue
+				except ValueError:
+					#Not a float
+					pass
+
+				out[field+'_s'] = prod[field]
+
+				out['id'] = prod['pd_id']
+			except:
+				print(prod)
+				print("ERROR WITH: {}".format(field))
+		if len(out) != len(prod)+1:
+			logging.error("Field count mismatch in product prep. Before: {}, After: {}".format(len(prod), len(out)))
+			logging.error(prod)
+			logging.error(out)
+		return out
+
+
+if __name__=='__main__':
+	logging.basicConfig(level='DEBUG')
+	e = EStar()
+	e.get_all()
+	s = SolrClient('http://localhost:8983/solr/')
+	e.index_to_solr('estar',s)
